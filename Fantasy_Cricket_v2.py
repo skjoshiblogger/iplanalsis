@@ -181,40 +181,230 @@ def log_sync(match_id, team_name, match_url='', status='done', note=''):
 # Receive match_url, fetch the scorecard, and call save_preview_player() for
 # each player you find. The data will appear in the admin panel for review.
 # ═════════════════════════════════════════════════════════════════════════════
+def _fantasy_pts_bat(runs, balls, fours, sixes, dismissed, wk=False):
+    """Estimate batting fantasy points (Dream11 T20 scoring)."""
+    pts = runs                          # 1 pt per run
+    pts += fours * 1                    # 1 extra per 4
+    pts += sixes * 2                    # 2 extra per 6
+    if runs >= 100: pts += 16
+    elif runs >= 50: pts += 8
+    elif runs >= 25: pts += 4
+    if dismissed and runs == 0: pts -= 2  # duck
+    # Strike rate bonus/penalty for 10+ balls
+    if balls >= 10:
+        sr = (runs / balls) * 100
+        if sr > 170:   pts += 6
+        elif sr > 150: pts += 4
+        elif sr > 130: pts += 2
+        elif sr < 50:  pts -= 6
+        elif sr < 60:  pts -= 4
+        elif sr < 70:  pts -= 2
+    return max(0, pts)
+
+def _fantasy_pts_bowl(wickets, overs, runs_given, maidens):
+    """Estimate bowling fantasy points (Dream11 T20 scoring)."""
+    pts = wickets * 25
+    if wickets >= 5:   pts += 16
+    elif wickets >= 4: pts += 8
+    elif wickets >= 3: pts += 4
+    pts += maidens * 12
+    # Economy bonus/penalty for 2+ overs
+    if overs >= 2:
+        economy = runs_given / overs if overs else 0
+        if economy < 5:    pts += 6
+        elif economy < 6:  pts += 4
+        elif economy < 7:  pts += 2
+        elif economy > 11: pts -= 6
+        elif economy > 10: pts -= 4
+        elif economy > 9:  pts -= 2
+    return max(0, pts)
+
+def _safe_int(val, default=0):
+    try: return int(str(val).strip().replace('-','0') or default)
+    except: return default
+
+def _safe_float(val, default=0.0):
+    try: return float(str(val).strip().replace('-','0') or default)
+    except: return default
+
 def fetch_scorecard(match_url, mid, team_a, team_b):
     """
-    TODO: Add your scorecard-fetching + parsing logic here.
+    Parse ESPN Cricinfo full-scorecard page and save players to fantasy_preview.
+    Works with URLs like:
+      https://www.espncricinfo.com/series/.../full-scorecard
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("[ERROR] pip install beautifulsoup4", file=sys.stderr)
+        return {"status": "error", "players_saved": 0,
+                "message": "beautifulsoup4 not installed. Run: pip install beautifulsoup4"}
 
-    For each player in the scorecard, call:
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
+
+    print(f"[INFO] Fetching: {match_url}", file=sys.stderr)
+    try:
+        resp = requests.get(match_url, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        return {"status": "error", "players_saved": 0, "message": f"HTTP error: {e}"}
+
+    soup = BeautifulSoup(resp.text, 'html.parser')
+
+    # ── Detect innings tables ─────────────────────────────────────────────────
+    # Cricinfo wraps each innings in a div. Team name appears above each table.
+    # We collect all batting rows + bowling rows and figure out teams from context.
+
+    players_data = {}   # player_name -> dict of accumulated stats
+
+    def get_team_name(heading_el):
+        """Extract team name from heading element above scorecard table."""
+        txt = heading_el.get_text(strip=True) if heading_el else ''
+        # "Royal Challengers Bengaluru Innings" → strip "Innings"
+        return txt.replace('Innings', '').replace('innings', '').strip()
+
+    # Find all scorecard table containers
+    # Cricinfo uses "ds-table" or similar pattern; also look for role="table"
+    all_tables = soup.find_all('table')
+
+    innings_blocks = []
+    # Each innings has a batting table followed by a bowling table
+    # We detect them by looking for header rows with "Batter" or "Bowler"
+    for tbl in all_tables:
+        headers_row = tbl.find('tr')
+        if not headers_row:
+            continue
+        col_texts = [th.get_text(strip=True).lower() for th in headers_row.find_all(['th','td'])]
+        col_str   = ' '.join(col_texts)
+
+        if 'batter' in col_str or ('r' in col_texts and 'b' in col_texts and '4s' in col_texts):
+            # Batting table — find nearest team heading
+            team_hint = ''
+            prev = tbl.find_previous(['h2','h3','h4','div'])
+            if prev:
+                team_hint = get_team_name(prev)
+
+            rows = tbl.find_all('tr')[1:]   # skip header
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) < 6:
+                    continue
+                name_cell = cells[0].get_text(strip=True)
+                if not name_cell or name_cell.lower() in ('extras','total','did not bat','fall of wickets'):
+                    continue
+                # Clean name: "Virat Kohli†" → "Virat Kohli"
+                name = name_cell.replace('†','').replace('(c)','').replace('(wk)','').strip()
+                is_wk = '†' in name_cell or 'stumped' in cells[1].get_text().lower()
+
+                # Dismissal info tells us if played
+                dismissal = cells[1].get_text(strip=True).lower() if len(cells) > 1 else ''
+                did_not_bat = 'did not bat' in dismissal or dismissal == ''
+                dismissed   = dismissal not in ('not out', 'did not bat', '')
+
+                runs    = _safe_int(cells[2].get_text())
+                balls   = _safe_int(cells[3].get_text())
+                fours   = _safe_int(cells[4].get_text())
+                sixes   = _safe_int(cells[5].get_text())
+
+                if name not in players_data:
+                    players_data[name] = {'team': team_hint, 'bat_pts': 0, 'bowl_pts': 0,
+                                          'is_wk': False, 'bowled': False, 'is_playing': 0,
+                                          'raw': {}}
+                players_data[name]['bat_pts'] += _fantasy_pts_bat(runs, balls, fours, sixes, dismissed, is_wk)
+                players_data[name]['is_wk']   = players_data[name]['is_wk'] or is_wk
+                players_data[name]['is_playing'] = 0 if did_not_bat else 1
+                players_data[name]['raw'].update({'runs': runs, 'balls': balls, '4s': fours, '6s': sixes})
+                if not players_data[name]['team'] and team_hint:
+                    players_data[name]['team'] = team_hint
+
+        elif 'bowler' in col_str or ('w' in col_texts and 'econ' in col_texts):
+            # Bowling table
+            team_hint = ''
+            prev = tbl.find_previous(['h2','h3','h4','div'])
+            if prev:
+                # Bowling table belongs to the fielding/bowling team — opposite of batting header
+                team_hint = get_team_name(prev)
+
+            rows = tbl.find_all('tr')[1:]
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) < 5:
+                    continue
+                name = cells[0].get_text(strip=True).replace('†','').replace('(c)','').strip()
+                if not name or name.lower() in ('extras','total','did not bat'):
+                    continue
+
+                overs    = _safe_float(cells[1].get_text())
+                maidens  = _safe_int(cells[2].get_text())
+                runs_g   = _safe_int(cells[3].get_text())
+                wickets  = _safe_int(cells[4].get_text())
+
+                if name not in players_data:
+                    players_data[name] = {'team': team_hint, 'bat_pts': 0, 'bowl_pts': 0,
+                                          'is_wk': False, 'bowled': False, 'is_playing': 0,
+                                          'raw': {}}
+                bowl_pts = _fantasy_pts_bowl(wickets, overs, runs_g, maidens)
+                players_data[name]['bowl_pts']   += bowl_pts
+                players_data[name]['bowled']      = True
+                players_data[name]['is_playing']  = 1
+                players_data[name]['raw'].update({'wickets': wickets, 'overs': overs,
+                                                  'runs_conceded': runs_g, 'economy': round(runs_g/overs, 2) if overs else 0})
+                if not players_data[name]['team'] and team_hint:
+                    players_data[name]['team'] = team_hint
+
+    if not players_data:
+        return {"status": "error", "players_saved": 0,
+                "message": "Could not parse any players from the scorecard page. "
+                           "Cricinfo may have changed their HTML, or the page required JS rendering."}
+
+    # ── Determine role and credits, save to DB ────────────────────────────────
+    saved = 0
+    for name, p in players_data.items():
+        bat_pts  = p['bat_pts']
+        bowl_pts = p['bowl_pts']
+        total    = bat_pts + bowl_pts
+
+        # Role detection
+        if p['is_wk']:
+            role = 'WK'
+        elif p['bowled'] and bat_pts > 20:
+            role = 'ALL'
+        elif p['bowled']:
+            role = 'BOWL'
+        else:
+            role = 'BAT'
+
+        # Estimated credits based on total pts (rough: 8–10.5 range)
+        if total >= 60:   cred = 10.0
+        elif total >= 40: cred = 9.5
+        elif total >= 25: cred = 9.0
+        elif total >= 10: cred = 8.5
+        else:             cred = 8.0
+        if p['is_wk']:    cred = min(cred + 0.5, 10.5)
+
         save_preview_player(
             match_id    = mid,
             match_url   = match_url,
-            player_name = "Virat Kohli",
-            team        = "RCB",
-            role        = "BAT",          # BAT / BOWL / ALL / WK
-            credits     = 10.5,
-            sel_percent = 74.5,
-            last_5_pts  = 320,
-            venue_pts   = 88,
-            is_playing  = 1,
-            raw_data    = {"runs":72, "balls":48, ...}   # optional extras
+            player_name = name,
+            team        = p['team'],
+            role        = role,
+            credits     = cred,
+            sel_percent = 0.0,      # not on scorecard page
+            last_5_pts  = int(total),
+            venue_pts   = int(total),   # same match = venue pts proxy
+            is_playing  = p['is_playing'],
+            raw_data    = p['raw'],
         )
+        saved += 1
+        print(f"[SAVED] {name} ({role}) pts={total}", file=sys.stderr)
 
-    Return a dict summary at the end.
-    """
-    # ── EXAMPLE (replace with your real scraper) ──────────────────────────────
-    # resp = requests.get(match_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30)
-    # soup = BeautifulSoup(resp.text, 'html.parser')
-    # ... parse players ...
-    # save_preview_player(mid, match_url, player_name, ...)
-
-    print(f"[INFO] Fetching: {match_url}", file=sys.stderr)
-    print(f"[INFO] Match {mid}: {team_a} vs {team_b}", file=sys.stderr)
-    print("[WARN] fetch_scorecard() is a placeholder — add your scraping logic.", file=sys.stderr)
-
-    return {"status": "placeholder", "players_saved": 0,
-            "message": "Add your scraping logic to fetch_scorecard() in Fantasy_Cricket_v2.py"}
-    # ─────────────────────────────────────────────────────────────────────────
+    return {"status": "ok", "players_saved": saved,
+            "message": f"Parsed and saved {saved} players from Cricinfo scorecard."}
 
 
 # ── Main action: fetch ────────────────────────────────────────────────────────
