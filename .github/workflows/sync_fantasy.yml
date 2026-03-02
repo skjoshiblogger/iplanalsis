@@ -1,0 +1,62 @@
+name: Fetch IPL Scorecard
+
+on:
+  # Triggered manually from build-best-team.php admin panel via GitHub API
+  repository_dispatch:
+    types: [fetch_scorecard]
+
+  # Also allow manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      mid:
+        description: 'Match ID (ipl_matches.id)'
+        required: true
+        default: '5'
+      team_a:
+        description: 'Team A (e.g. CSK)'
+        required: true
+        default: 'CSK'
+      team_b:
+        description: 'Team B (e.g. MI)'
+        required: true
+        default: 'MI'
+      match_url:
+        description: 'Full scorecard URL to fetch'
+        required: true
+        default: 'https://cricinfo.com/...'
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install mysql-connector-python requests beautifulsoup4 lxml
+
+      - name: Run scorecard fetch
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_PORT: ${{ secrets.DB_PORT || '3306' }}
+        run: |
+          # Pull inputs from either repository_dispatch (client_payload) or workflow_dispatch
+          MID="${{ github.event.client_payload.mid || github.event.inputs.mid }}"
+          TEAM_A="${{ github.event.client_payload.team_a || github.event.inputs.team_a }}"
+          TEAM_B="${{ github.event.client_payload.team_b || github.event.inputs.team_b }}"
+          MATCH_URL="${{ github.event.client_payload.match_url || github.event.inputs.match_url }}"
+
+          echo "Match ID : $MID"
+          echo "Teams    : $TEAM_A vs $TEAM_B"
+          echo "URL      : $MATCH_URL"
+
+          python script/Fantasy_Cricket_v2.py fetch \
+            "{\"mid\":$MID,\"team_a\":\"$TEAM_A\",\"team_b\":\"$TEAM_B\",\"match_url\":\"$MATCH_URL\"}"
