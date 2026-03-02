@@ -38,7 +38,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install mysql-connector-python requests beautifulsoup4
+        run: pip install mysql-connector-python requests beautifulsoup4 lxml
 
       - name: Run scorecard fetch
         env:
