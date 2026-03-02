@@ -58,5 +58,5 @@ jobs:
           echo "Teams    : $TEAM_A vs $TEAM_B"
           echo "URL      : $MATCH_URL"
 
-          python script/Fantasy_Cricket_v2.py fetch \
+          python Fantasy_Cricket_v2.py fetch \
             "{\"mid\":$MID,\"team_a\":\"$TEAM_A\",\"team_b\":\"$TEAM_B\",\"match_url\":\"$MATCH_URL\"}"
